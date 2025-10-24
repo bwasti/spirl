@@ -15,15 +15,22 @@ This project demonstrates:
 
 ### 1. Install Dependencies
 
-Install vllm nightly
+Install vLLM nightly:
 ```bash
-
+pip install https://vllm-wheels.s3.us-west-2.amazonaws.com/nightly/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
 ```
 
-Install TorchTitan from [here](https://github.com/bwasti/torchtitan/tree/shim)
-
+Install TorchTitan from the custom fork:
 ```bash
+git clone -b shim https://github.com/bwasti/torchtitan.git
+cd torchtitan
+pip install -e .
+cd ..
+```
 
+Install other dependencies:
+```bash
+pip install torch safetensors huggingface_hub transformers tensorboard
 ```
 
 ### 2. Run the training script!
