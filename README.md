@@ -1,7 +1,9 @@
-# Simple Deterministic RL Training with vLLM & TorchTitan
+# Single-file Deterministic RL Training with vLLM & TorchTitan
 
 This is a project demonstrating simple, readable RL.
 It achieves bitwise-deterministic reinforcement learning for language models using vLLM for generation and TorchTitan for training.
+
+The single file is [here](https://github.com/bwasti/spirl/blob/main/simple_rl.py).
 
 ## Overview
 
