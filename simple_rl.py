@@ -64,25 +64,62 @@ class VLLMRolloutEngine:
         self.llm = None
         print("vLLM rollout engine initialized (will load on first use)")
 
-    def update_weights(self, titan_state: dict) -> None:
+    def update_weights(self, vllm_compat_state: dict) -> None:
         """
-        Update vLLM model weights from TorchTitan state dict.
+        Update vLLM model weights from vLLM-compat state dict.
 
         This converts weights to vLLM format, saves them, and reloads using
         vLLM's reload_weights() API after updating the model path config.
 
         Args:
-            titan_state: TorchTitan model state dict
+            vllm_compat_state: vLLM-compat model state dict (with gate_up_proj/down_proj)
         """
-        # Convert to vLLM format
+        # Debug: Check if input weights changed
+        sample_key = "tok_embeddings.weight"
+        if sample_key in vllm_compat_state and self.llm is not None:
+            print(f"  [DEBUG] Input vllm_compat_state[{sample_key}] sample: {vllm_compat_state[sample_key][0, :5]}")
+
+        # Convert vLLM-compat -> TorchTitan -> vLLM
+        titan_state = vllm_compat_to_torchtitan(vllm_compat_state)
+
+        # Debug: Check after first conversion
+        if sample_key in titan_state and self.llm is not None:
+            print(f"  [DEBUG] After vllm_compat→titan, titan_state[{sample_key}] sample: {titan_state[sample_key][0, :5]}")
+
         vllm_state = torchtitan_to_vllm(titan_state)
+
+        # Debug: Check after second conversion
+        vllm_sample_key = "model.embed_tokens.weight"
+        if vllm_sample_key in vllm_state and self.llm is not None:
+            print(f"  [DEBUG] After titan→vllm, vllm_state[{vllm_sample_key}] sample: {vllm_state[vllm_sample_key][0, :5]}")
 
         # Save to temp model directory
         checkpoint_path = os.path.join(self.temp_model_dir, "model.safetensors")
         save_file(vllm_state, checkpoint_path)
 
+        # Debug: Verify weights are actually different
+        if self.llm is not None:
+            # Get a sample weight to check if it changed
+            sample_key = "model.embed_tokens.weight"
+            if sample_key in vllm_state:
+                new_weight = vllm_state[sample_key]
+                # Load old weight from disk
+                old_checkpoint = os.path.join(self.temp_model_dir, "model_prev.safetensors")
+                if os.path.exists(old_checkpoint):
+                    from safetensors.torch import load_file as sf_load
+                    old_vllm_state = sf_load(old_checkpoint)
+                    old_weight = old_vllm_state[sample_key].to(new_weight.device)  # Move to same device
+                    weight_diff = (new_weight - old_weight).abs().max().item()
+                    print(f"  [DEBUG] Weight update: max diff in {sample_key} = {weight_diff:.6e}")
+                    if weight_diff < 1e-10:
+                        print(f"  [WARNING] Weights unchanged! May indicate update not working.")
+                # Save current as prev for next comparison
+                import shutil
+                shutil.copy2(checkpoint_path, old_checkpoint)
+
         # First time: create the engine
         if self.llm is None:
+            print(f"  [DEBUG] Creating vLLM engine with initial weights")
             self.llm = LLM(
                 model=self.temp_model_dir,
                 trust_remote_code=True,
@@ -90,15 +127,12 @@ class VLLMRolloutEngine:
                 dtype="bfloat16",
                 gpu_memory_utilization=0.3,  # Reduced from 0.5
             )
+            print(f"  [DEBUG] Engine created")
         else:
-            # Update the model path in config to point to our temp directory
-            self.llm.collective_rpc(
-                "update_config",
-                args=({"model_config": {"model": self.temp_model_dir}},)
-            )
-
-            # Reload weights from the new path
+            # Reload weights from the same path (model.safetensors was overwritten)
+            print(f"  [DEBUG] Reloading vLLM weights from {checkpoint_path}")
             self.llm.collective_rpc("reload_weights")
+            print(f"  [DEBUG] Reload complete")
 
     @torch.no_grad()
     def generate(
@@ -211,7 +245,7 @@ def download_and_convert_model(model_name: str, cache_dir: str = "./models", out
     return titan_checkpoint_path, model_path
 
 
-def load_model(checkpoint_path: str, model_path: str) -> Qwen3Model:
+def load_model(checkpoint_path: str, model_path: str) -> Qwen3VLLMCompatModel:
     """
     Load TorchTitan model from checkpoint.
 
@@ -426,7 +460,9 @@ def compute_policy_gradient_loss_vllm(
 
         # Forward pass
         logits = model(full_tensor)
-        log_probs = F.log_softmax(logits.float()[:, :-1, :], dim=-1)
+        # Use F.log_softmax which is overridden by batch_invariant mode for determinism
+        # Convert to float32 to match vLLM's sampler behavior (use .to() to preserve gradients)
+        log_probs = F.log_softmax(logits[:, :-1, :].to(torch.float32), dim=-1)
         target_tokens = full_tensor[:, 1:]
 
         # Extract log probs for generated tokens only
@@ -466,48 +502,51 @@ def compute_policy_gradient_loss_vllm(
         print(f"{'='*80}")
         num_tokens_to_show = min(3, len(first_sample_deltas))
 
-        # Convert vLLM logprobs to bfloat16 tensor for bitwise comparison
-        vllm_lps_bf16 = torch.tensor(
+        # Compare in float32 (the precision both were computed in)
+        vllm_lps_f32 = torch.tensor(
             [d['vllm_logprob'] for d in first_sample_deltas],
-            dtype=torch.bfloat16
+            dtype=torch.float32
         )
-        titan_lps_bf16 = torch.stack([d['titan_logprob_bf16'] for d in first_sample_deltas])
+        titan_lps_f32 = torch.tensor(
+            [d['titan_logprob_f32'] for d in first_sample_deltas],
+            dtype=torch.float32
+        )
 
-        # Bitwise comparison in bfloat16
-        bitwise_identical = torch.equal(vllm_lps_bf16, titan_lps_bf16)
-        num_different = (vllm_lps_bf16 != titan_lps_bf16).sum().item()
+        # Bitwise comparison in float32
+        bitwise_identical = torch.equal(vllm_lps_f32, titan_lps_f32)
+        num_different = (vllm_lps_f32 != titan_lps_f32).sum().item()
 
         for i in range(num_tokens_to_show):
             token_info = first_sample_deltas[i]
-            vllm_val = vllm_lps_bf16[i]
-            titan_val = titan_lps_bf16[i]
+            vllm_val = vllm_lps_f32[i]
+            titan_val = titan_lps_f32[i]
             match = "✓" if vllm_val == titan_val else "✗"
 
             print(f"Token {i+1}: ID={token_info['token_id']} [{match}]")
-            print(f"  vLLM gen (bf16):     {vllm_val.item():.10f}  [hex: {vllm_val.view(torch.int16).item():04x}]")
-            print(f"  Titan train (bf16):  {titan_val.item():.10f}  [hex: {titan_val.view(torch.int16).item():04x}]")
+            print(f"  vLLM gen (f32):      {vllm_val.item():.10f}")
+            print(f"  Titan train (f32):   {titan_val.item():.10f}")
 
-            # Show float32 difference for reference
-            delta_f32 = abs(token_info['vllm_logprob'] - token_info['titan_logprob_f32'])
-            print(f"  Δ (fp32 math):       {delta_f32:.15f}")
+            # Show difference
+            delta = abs(vllm_val.item() - titan_val.item())
+            print(f"  Δ (f32):             {delta:.15f}")
 
         # Summary
         print(f"\nBitwise Summary over {len(first_sample_deltas)} tokens:")
-        print(f"  Bitwise identical (bf16): {bitwise_identical}")
+        print(f"  Bitwise identical (f32): {bitwise_identical}")
         print(f"  Different tokens: {num_different} / {len(first_sample_deltas)}")
 
         if bitwise_identical:
             print(f"  ✓✓✓ EXACT BITWISE MATCH!")
         else:
-            # Compute float32 deltas for comparison
-            deltas_f32 = [abs(d['vllm_logprob'] - d['titan_logprob_f32']) for d in first_sample_deltas]
-            max_delta = max(deltas_f32)
-            avg_delta = sum(deltas_f32) / len(deltas_f32)
-            print(f"  Max delta (fp32): {max_delta:.15f}")
-            print(f"  Avg delta (fp32): {avg_delta:.15f}")
+            # Compute deltas
+            deltas = (vllm_lps_f32 - titan_lps_f32).abs()
+            max_delta = deltas.max().item()
+            avg_delta = deltas.mean().item()
+            print(f"  Max delta (f32): {max_delta:.15f}")
+            print(f"  Avg delta (f32): {avg_delta:.15f}")
 
             if max_delta < 1e-7:
-                print(f"  ✓✓ Excellent (< 1e-7, within bfloat16 precision)")
+                print(f"  ✓✓ Excellent (< 1e-7)")
             elif max_delta < 1e-4:
                 print(f"  ✓ Good (< 1e-4)")
             else:
@@ -614,6 +653,18 @@ def rl_update_step(
 
     optimizer.step()
 
+    # Debug: Check if model weights actually changed
+    sample_param_name = "tok_embeddings"
+    for name, param in model.named_parameters():
+        if sample_param_name in name:
+            if param.grad is not None:
+                print(f"  [DEBUG] After optimizer.step(), {name} grad norm: {param.grad.norm().item():.6e}")
+                print(f"  [DEBUG] After optimizer.step(), {name} grad sample: {param.grad.data[0, :5]}")
+            else:
+                print(f"  [DEBUG] After optimizer.step(), {name} has NO GRADIENT!")
+            print(f"  [DEBUG] After optimizer.step(), {name} weight sample: {param.data[0, :5]}")
+            break
+
     # Return metrics - merge all loss_metrics into the main metrics dict
     metrics = {
         "loss": loss.item(),
@@ -649,8 +700,10 @@ def compute_weight_deltas(model: torch.nn.Module, initial_state: dict) -> dict:
             if name not in initial_state:
                 continue
 
-            initial_param = initial_state[name].to(current_param.device)
-            delta = current_param - initial_param
+            # Move current param to CPU to compare with initial (avoid GPU OOM)
+            current_param_cpu = current_param.cpu()
+            initial_param = initial_state[name]
+            delta = current_param_cpu - initial_param
 
             # Extract module name (e.g., "layers.0.attention.wq" -> "layers.0")
             parts = name.split('.')
@@ -661,7 +714,7 @@ def compute_weight_deltas(model: torch.nn.Module, initial_state: dict) -> dict:
 
             # Compute magnitude (L2 norm) of change
             delta_norm = torch.norm(delta).item()
-            param_norm = torch.norm(current_param).item()
+            param_norm = torch.norm(current_param_cpu).item()
 
             # Relative change: ||delta|| / ||param||
             relative_change = delta_norm / (param_norm + 1e-8)
@@ -690,18 +743,15 @@ def main():
     output_dir = "./converted"
 
     group_size = 4  # For GRPO - samples per prompt
-    num_steps = 100
+    num_steps = 2  # Quick test - change to 100 for full training
     learning_rate = 1e-5
 
-    # Enable batch_invariant mode with backward support
-    # This provides deterministic forward passes for training
-    print("Enabling deterministic forward passes with gradient support...")
-    from batch_invariant_backward import enable_batch_invariant_backward_mode
-    from vllm.model_executor.layers.batch_invariant import disable_batch_invariant_mode
-
-    # Disable vLLM's batch_invariant (no backward) and enable ours (with backward)
-    disable_batch_invariant_mode()
-    enable_batch_invariant_backward_mode()
+    # Add backward pass support to vLLM's batch_invariant mode
+    # vLLM's init_batch_invariance() already set up deterministic forward passes,
+    # now we patch in backward support without disabling anything
+    print("Adding gradient support to vLLM's batch_invariant mode...")
+    from batch_invariant_backward import patch_batch_invariant_with_gradients
+    patch_batch_invariant_with_gradients()
 
     # Download and convert model
     print("=" * 80)
@@ -790,19 +840,6 @@ def main():
               f"Reward: {metrics['reward_mean']:+.3f}±{metrics['reward_std']:.3f} | "
               f"Advantage: {metrics['advantage_mean']:+.3f}±{metrics['advantage_std']:.3f}")
         print(f"  Sample: {metrics['sample_completions'][0][:60]}...")
-
-        # Print per-token logprob deltas (first sample, all tokens)
-        if 'per_token_deltas' in metrics:
-            deltas = metrics['per_token_deltas']
-            print(f"  Per-token logprob deltas (first sample, {len(deltas)} tokens):")
-            for i, delta_info in enumerate(deltas):
-                token_id = delta_info['token_id']
-                vllm_lp = delta_info['vllm_logprob']
-                titan_lp = delta_info['titan_logprob']
-                delta = delta_info['delta']
-                token_str = tokenizer.decode([token_id])
-                print(f"    Token {i:2d} (id={token_id:5d}, '{token_str:>10s}'): "
-                      f"vLLM={vllm_lp:8.4f}, Titan={titan_lp:8.4f}, delta={delta:.6f}")
 
     print("\n" + "=" * 80)
     print("Training complete!")
