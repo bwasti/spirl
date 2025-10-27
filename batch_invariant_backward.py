@@ -29,6 +29,73 @@ Usage:
 """
 
 import torch
+from torch.autograd import Function
+
+
+# ============================================================================
+# Custom autograd Functions for vLLM operations
+# ============================================================================
+
+class RMSNormFunction(Function):
+    """
+    Autograd function for RMS normalization using vLLM's Triton kernel in forward
+    and batch-invariant operations in backward.
+    """
+
+    @staticmethod
+    def forward(ctx, input, weight, eps):
+        """
+        Forward pass using vLLM's rms_norm Triton kernel.
+
+        Args:
+            input: Input tensor [*, hidden_size]
+            weight: Weight tensor [hidden_size]
+            eps: Epsilon for numerical stability
+
+        Returns:
+            output: Normalized and scaled tensor [*, hidden_size]
+        """
+        from vllm.model_executor.layers.batch_invariant import rms_norm as vllm_rms_norm
+
+        # Use vLLM's Triton kernel for forward (deterministic)
+        output = vllm_rms_norm(input, weight, eps)
+
+        # Save for backward
+        ctx.save_for_backward(input, weight)
+        ctx.eps = eps
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Backward pass using batch-invariant PyTorch operations.
+
+        Returns:
+            (grad_input, grad_weight, None)
+        """
+        input, weight = ctx.saved_tensors
+        eps = ctx.eps
+
+        # Compute forward pass values needed for backward
+        # variance = mean(x^2) along last dim
+        variance = (input * input).mean(dim=-1, keepdim=True)
+        rms = torch.sqrt(variance + eps)
+        x_norm = input / rms
+
+        # Gradient w.r.t. weight
+        # grad_weight = sum(grad_output * x_norm) over all dims except last
+        grad_weight = (grad_output * x_norm).sum(dim=tuple(range(grad_output.ndim - 1)))
+
+        # Gradient w.r.t. input
+        # grad_x_norm = grad_output * weight
+        grad_x_norm = grad_output * weight
+
+        # grad_x = (grad_x_norm - mean(grad_x_norm * x_norm) * x_norm) / rms
+        mean_term = (grad_x_norm * x_norm).mean(dim=-1, keepdim=True)
+        grad_input = (grad_x_norm - mean_term * x_norm) / rms
+
+        return grad_input, grad_weight, None
 
 
 # ============================================================================
@@ -132,6 +199,53 @@ def linear_backward_impl(grad_output, input, weight, output_mask):
     return grad_input, grad_weight, grad_bias
 
 
+def rms_norm_backward_impl(grad_output, input, weight, eps):
+    """
+    Backward pass for RMS normalization.
+
+    Forward: y = x / sqrt(mean(x^2) + eps) * weight
+
+    Let:
+        variance = mean(x^2)
+        rms = sqrt(variance + eps)
+        x_norm = x / rms
+        y = x_norm * weight
+
+    Gradients:
+        grad_weight = sum(grad_output * x_norm) over all dims except last
+        grad_x_norm = grad_output * weight
+        grad_x = (grad_x_norm - mean(grad_x_norm * x_norm) * x_norm) / rms
+
+    Args:
+        grad_output: Gradient from downstream [*, hidden_size]
+        input: Input tensor [*, hidden_size]
+        weight: Weight tensor [hidden_size]
+        eps: Epsilon for numerical stability
+
+    Returns:
+        (grad_input, grad_weight)
+    """
+    # Compute forward pass values needed for backward
+    # variance = mean(x^2) along last dim
+    variance = (input * input).mean(dim=-1, keepdim=True)
+    rms = torch.sqrt(variance + eps)
+    x_norm = input / rms
+
+    # Gradient w.r.t. weight
+    # grad_weight = sum(grad_output * x_norm) over all dims except last
+    grad_weight = (grad_output * x_norm).sum(dim=tuple(range(grad_output.ndim - 1)))
+
+    # Gradient w.r.t. input
+    # grad_x_norm = grad_output * weight
+    grad_x_norm = grad_output * weight
+
+    # grad_x = (grad_x_norm - mean(grad_x_norm * x_norm) * x_norm) / rms
+    mean_term = (grad_x_norm * x_norm).mean(dim=-1, keepdim=True)
+    grad_input = (grad_x_norm - mean_term * x_norm) / rms
+
+    return grad_input, grad_weight
+
+
 # ============================================================================
 # Registration
 # ============================================================================
@@ -190,3 +304,25 @@ def disable_batch_invariant_backward_mode():
 def is_batch_invariant_backward_mode_enabled():
     """Check if batch invariant backward mode is enabled."""
     return _batch_invariant_backward_MODE
+
+
+# ============================================================================
+# Public API for gradient-enabled vLLM operations
+# ============================================================================
+
+def rms_norm_with_gradients(input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    RMS normalization with gradient support.
+
+    Uses vLLM's Triton kernel for forward pass (deterministic) and
+    batch-invariant PyTorch operations for backward pass.
+
+    Args:
+        input: Input tensor [*, hidden_size]
+        weight: Weight tensor [hidden_size]
+        eps: Epsilon for numerical stability
+
+    Returns:
+        output: Normalized and scaled tensor [*, hidden_size]
+    """
+    return RMSNormFunction.apply(input, weight, eps)

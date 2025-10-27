@@ -24,7 +24,7 @@ import torchtitan.experiments.compat
 from torchtitan.models.qwen3.model.model_vllm_compat import Qwen3VLLMCompatModel
 from torchtitan.models.qwen3.model.args import Qwen3ModelArgs
 from weights_vllm_compat import torchtitan_to_vllm_compat, vllm_compat_to_torchtitan
-from weights import torchtitan_to_vllm, vllm_to_torchtitan
+from weights.converter import torchtitan_to_vllm, vllm_to_torchtitan
 
 from vllm import LLM, SamplingParams
 from vllm.model_executor.layers.batch_invariant import init_batch_invariance
@@ -50,16 +50,28 @@ class VLLMRolloutEngine:
             temp_checkpoint_dir: Directory to save temporary weight checkpoints
         """
         self.base_model_path = model_path
-        self.temp_model_dir = os.path.join(temp_checkpoint_dir, "vllm_temp_model")
+        self.temp_model_dir = os.path.abspath(os.path.join(temp_checkpoint_dir, "vllm_temp_model"))
         os.makedirs(self.temp_model_dir, exist_ok=True)
 
         # Copy config/tokenizer files from base model to temp dir
         import shutil
+        import glob
         for file in ["config.json", "tokenizer.json", "tokenizer_config.json",
                      "special_tokens_map.json", "merges.txt", "vocab.json"]:
             src = os.path.join(model_path, file)
             if os.path.exists(src):
                 shutil.copy2(src, self.temp_model_dir)
+
+        # Copy the original model shard files if they exist
+        # We'll overwrite these with our single model.safetensors later
+        for shard_file in glob.glob(os.path.join(model_path, "model-*.safetensors")):
+            dst = os.path.join(self.temp_model_dir, os.path.basename(shard_file))
+            shutil.copy2(shard_file, dst)
+
+        # Copy index file if it exists
+        index_file = os.path.join(model_path, "model.safetensors.index.json")
+        if os.path.exists(index_file):
+            shutil.copy2(index_file, self.temp_model_dir)
 
         self.llm = None
         print("vLLM rollout engine initialized (will load on first use)")
@@ -74,52 +86,48 @@ class VLLMRolloutEngine:
         Args:
             vllm_compat_state: vLLM-compat model state dict (with gate_up_proj/down_proj)
         """
-        # Debug: Check if input weights changed
-        sample_key = "tok_embeddings.weight"
-        if sample_key in vllm_compat_state and self.llm is not None:
-            print(f"  [DEBUG] Input vllm_compat_state[{sample_key}] sample: {vllm_compat_state[sample_key][0, :5]}")
-
         # Convert vLLM-compat -> TorchTitan -> vLLM
         titan_state = vllm_compat_to_torchtitan(vllm_compat_state)
-
-        # Debug: Check after first conversion
-        if sample_key in titan_state and self.llm is not None:
-            print(f"  [DEBUG] After vllm_compat→titan, titan_state[{sample_key}] sample: {titan_state[sample_key][0, :5]}")
-
         vllm_state = torchtitan_to_vllm(titan_state)
-
-        # Debug: Check after second conversion
-        vllm_sample_key = "model.embed_tokens.weight"
-        if vllm_sample_key in vllm_state and self.llm is not None:
-            print(f"  [DEBUG] After titan→vllm, vllm_state[{vllm_sample_key}] sample: {vllm_state[vllm_sample_key][0, :5]}")
 
         # Save to temp model directory
         checkpoint_path = os.path.join(self.temp_model_dir, "model.safetensors")
-        save_file(vllm_state, checkpoint_path)
 
-        # Debug: Verify weights are actually different
-        if self.llm is not None:
-            # Get a sample weight to check if it changed
-            sample_key = "model.embed_tokens.weight"
-            if sample_key in vllm_state:
-                new_weight = vllm_state[sample_key]
-                # Load old weight from disk
-                old_checkpoint = os.path.join(self.temp_model_dir, "model_prev.safetensors")
-                if os.path.exists(old_checkpoint):
-                    from safetensors.torch import load_file as sf_load
-                    old_vllm_state = sf_load(old_checkpoint)
-                    old_weight = old_vllm_state[sample_key].to(new_weight.device)  # Move to same device
-                    weight_diff = (new_weight - old_weight).abs().max().item()
-                    print(f"  [DEBUG] Weight update: max diff in {sample_key} = {weight_diff:.6e}")
-                    if weight_diff < 1e-10:
-                        print(f"  [WARNING] Weights unchanged! May indicate update not working.")
-                # Save current as prev for next comparison
-                import shutil
-                shutil.copy2(checkpoint_path, old_checkpoint)
+        # Update the shard files that vLLM will actually load
+        # We need to split our weights to match the original 2-shard structure
+        import glob
+        import json
+
+        shard_files = sorted(glob.glob(os.path.join(self.temp_model_dir, "model-*.safetensors")))
+        index_file = os.path.join(self.temp_model_dir, "model.safetensors.index.json")
+
+        if len(shard_files) == 2 and os.path.exists(index_file):
+            # Load the index to see which weights go in which shard
+            with open(index_file, 'r') as f:
+                index_data = json.load(f)
+
+            weight_map = index_data['weight_map']
+
+            # Split weights according to the index
+            shard1_weights = {}
+            shard2_weights = {}
+
+            for key, value in vllm_state.items():
+                shard_file = weight_map.get(key, shard_files[0])
+                if 'model-00001-of-00002' in shard_file:
+                    shard1_weights[key] = value
+                else:
+                    shard2_weights[key] = value
+
+            # Save to the shard files
+            save_file(shard1_weights, shard_files[0])
+            save_file(shard2_weights, shard_files[1])
+        else:
+            # Fallback: save as single file
+            save_file(vllm_state, checkpoint_path)
 
         # First time: create the engine
         if self.llm is None:
-            print(f"  [DEBUG] Creating vLLM engine with initial weights")
             self.llm = LLM(
                 model=self.temp_model_dir,
                 trust_remote_code=True,
@@ -127,12 +135,19 @@ class VLLMRolloutEngine:
                 dtype="bfloat16",
                 gpu_memory_utilization=0.3,  # Reduced from 0.5
             )
-            print(f"  [DEBUG] Engine created")
         else:
-            # Reload weights from the same path (model.safetensors was overwritten)
-            print(f"  [DEBUG] Reloading vLLM weights from {checkpoint_path}")
-            self.llm.collective_rpc("reload_weights")
-            print(f"  [DEBUG] Reload complete")
+            # vLLM V1's reload_weights() is broken - it doesn't actually reload from disk
+            # The only reliable way is to recreate the engine
+            del self.llm
+            torch.cuda.empty_cache()
+
+            self.llm = LLM(
+                model=self.temp_model_dir,
+                trust_remote_code=True,
+                max_model_len=2048,
+                dtype="bfloat16",
+                gpu_memory_utilization=0.3,
+            )
 
     @torch.no_grad()
     def generate(
@@ -495,14 +510,8 @@ def compute_policy_gradient_loss_vllm(
 
     total_log_probs = torch.stack(batch_total_log_probs)
 
-    # Debug: Print comparison for first few tokens to verify determinism
+    # Verify bitwise determinism between generation and training
     if first_sample_deltas:
-        print(f"\n{'='*80}")
-        print(f"Forward Pass Determinism Check (Training vs Generation)")
-        print(f"{'='*80}")
-        num_tokens_to_show = min(3, len(first_sample_deltas))
-
-        # Compare in float32 (the precision both were computed in)
         vllm_lps_f32 = torch.tensor(
             [d['vllm_logprob'] for d in first_sample_deltas],
             dtype=torch.float32
@@ -512,47 +521,17 @@ def compute_policy_gradient_loss_vllm(
             dtype=torch.float32
         )
 
-        # Bitwise comparison in float32
         bitwise_identical = torch.equal(vllm_lps_f32, titan_lps_f32)
-        num_different = (vllm_lps_f32 != titan_lps_f32).sum().item()
-
-        for i in range(num_tokens_to_show):
-            token_info = first_sample_deltas[i]
-            vllm_val = vllm_lps_f32[i]
-            titan_val = titan_lps_f32[i]
-            match = "✓" if vllm_val == titan_val else "✗"
-
-            print(f"Token {i+1}: ID={token_info['token_id']} [{match}]")
-            print(f"  vLLM gen (f32):      {vllm_val.item():.10f}")
-            print(f"  Titan train (f32):   {titan_val.item():.10f}")
-
-            # Show difference
-            delta = abs(vllm_val.item() - titan_val.item())
-            print(f"  Δ (f32):             {delta:.15f}")
-
-        # Summary
-        print(f"\nBitwise Summary over {len(first_sample_deltas)} tokens:")
-        print(f"  Bitwise identical (f32): {bitwise_identical}")
-        print(f"  Different tokens: {num_different} / {len(first_sample_deltas)}")
 
         if bitwise_identical:
-            print(f"  ✓✓✓ EXACT BITWISE MATCH!")
+            print(f"  ✓ Bitwise determinism verified: {len(first_sample_deltas)} tokens match exactly")
         else:
-            # Compute deltas
+            num_different = (vllm_lps_f32 != titan_lps_f32).sum().item()
             deltas = (vllm_lps_f32 - titan_lps_f32).abs()
             max_delta = deltas.max().item()
             avg_delta = deltas.mean().item()
-            print(f"  Max delta (f32): {max_delta:.15f}")
-            print(f"  Avg delta (f32): {avg_delta:.15f}")
-
-            if max_delta < 1e-7:
-                print(f"  ✓✓ Excellent (< 1e-7)")
-            elif max_delta < 1e-4:
-                print(f"  ✓ Good (< 1e-4)")
-            else:
-                print(f"  ⚠ Warning: Large difference detected")
-
-        print(f"{'='*80}\n")
+            print(f"  ⚠ Determinism check: {num_different}/{len(first_sample_deltas)} tokens differ")
+            print(f"    Max delta: {max_delta:.6e}, Avg delta: {avg_delta:.6e}")
 
     # PPO clipped objective
     log_ratio = total_log_probs - ref_log_probs
@@ -652,18 +631,6 @@ def rl_update_step(
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
     optimizer.step()
-
-    # Debug: Check if model weights actually changed
-    sample_param_name = "tok_embeddings"
-    for name, param in model.named_parameters():
-        if sample_param_name in name:
-            if param.grad is not None:
-                print(f"  [DEBUG] After optimizer.step(), {name} grad norm: {param.grad.norm().item():.6e}")
-                print(f"  [DEBUG] After optimizer.step(), {name} grad sample: {param.grad.data[0, :5]}")
-            else:
-                print(f"  [DEBUG] After optimizer.step(), {name} has NO GRADIENT!")
-            print(f"  [DEBUG] After optimizer.step(), {name} weight sample: {param.data[0, :5]}")
-            break
 
     # Return metrics - merge all loss_metrics into the main metrics dict
     metrics = {

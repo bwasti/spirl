@@ -34,36 +34,42 @@ VLLM_TO_TITAN_MAP = {
 }
 
 
-def vllm_to_torchtitan(vllm_path: str) -> dict[str, torch.Tensor]:
+def vllm_to_torchtitan(vllm_path_or_state: str | dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """
     Load weights from vLLM format (HuggingFace) and convert to TorchTitan format.
 
     Args:
-        vllm_path: Path to vLLM model directory (contains .safetensors or .bin files)
+        vllm_path_or_state: Either a path to vLLM model directory (contains .safetensors or .bin files)
+                            OR a vLLM state dict
 
     Returns:
         Dictionary with TorchTitan-formatted state dict
     """
-    vllm_path = Path(vllm_path)
-
-    # Load weights from vLLM format (try safetensors first, then .bin)
-    vllm_state = {}
-    safetensor_files = sorted(vllm_path.glob("*.safetensors"))
-
-    if safetensor_files:
-        print(f"Loading {len(safetensor_files)} safetensors files...")
-        for st_file in safetensor_files:
-            if "index" not in st_file.name:  # Skip index files
-                vllm_state.update(load_file(str(st_file)))
+    # Check if input is a state dict or a path
+    if isinstance(vllm_path_or_state, dict):
+        vllm_state = vllm_path_or_state
+        print(f"Using provided vLLM state dict with {len(vllm_state)} weights")
     else:
-        # Fallback to .bin files
-        bin_files = sorted(vllm_path.glob("*.bin"))
-        print(f"Loading {len(bin_files)} .bin files...")
-        for bin_file in bin_files:
-            state = torch.load(bin_file, map_location="cpu", weights_only=True)
-            vllm_state.update(state)
+        vllm_path = Path(vllm_path_or_state)
 
-    print(f"Loaded {len(vllm_state)} weights from vLLM format")
+        # Load weights from vLLM format (try safetensors first, then .bin)
+        vllm_state = {}
+        safetensor_files = sorted(vllm_path.glob("*.safetensors"))
+
+        if safetensor_files:
+            print(f"Loading {len(safetensor_files)} safetensors files...")
+            for st_file in safetensor_files:
+                if "index" not in st_file.name:  # Skip index files
+                    vllm_state.update(load_file(str(st_file)))
+        else:
+            # Fallback to .bin files
+            bin_files = sorted(vllm_path.glob("*.bin"))
+            print(f"Loading {len(bin_files)} .bin files...")
+            for bin_file in bin_files:
+                state = torch.load(bin_file, map_location="cpu", weights_only=True)
+                vllm_state.update(state)
+
+        print(f"Loaded {len(vllm_state)} weights from vLLM format")
 
     # Convert to TorchTitan format
     titan_state = {}
