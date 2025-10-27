@@ -21,7 +21,6 @@ import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
 import torchtitan.experiments.compat
-from torchtitan.models.qwen3.model.model_vllm_compat import Qwen3VLLMCompatModel
 from torchtitan.models.qwen3.model.args import Qwen3ModelArgs
 from weights_vllm_compat import torchtitan_to_vllm_compat, vllm_compat_to_torchtitan
 from weights.converter import torchtitan_to_vllm, vllm_to_torchtitan
@@ -119,10 +118,16 @@ class VLLMRolloutEngine:
                 else:
                     shard2_weights[key] = value
 
+            # Ensure weights stay in bfloat16
+            shard1_weights = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in shard1_weights.items()}
+            shard2_weights = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in shard2_weights.items()}
+
             # Save to the shard files
             save_file(shard1_weights, shard_files[0])
             save_file(shard2_weights, shard_files[1])
         else:
+            # Ensure weights stay in bfloat16
+            vllm_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in vllm_state.items()}
             # Fallback: save as single file
             save_file(vllm_state, checkpoint_path)
 
@@ -134,6 +139,7 @@ class VLLMRolloutEngine:
                 max_model_len=2048,
                 dtype="bfloat16",
                 gpu_memory_utilization=0.3,  # Reduced from 0.5
+                seed=42,  # Fixed seed for determinism
             )
         else:
             # vLLM V1's reload_weights() is broken - it doesn't actually reload from disk
@@ -147,6 +153,7 @@ class VLLMRolloutEngine:
                 max_model_len=2048,
                 dtype="bfloat16",
                 gpu_memory_utilization=0.3,
+                seed=42,  # Fixed seed for determinism
             )
 
     @torch.no_grad()
@@ -260,13 +267,14 @@ def download_and_convert_model(model_name: str, cache_dir: str = "./models", out
     return titan_checkpoint_path, model_path
 
 
-def load_model(checkpoint_path: str, model_path: str) -> Qwen3VLLMCompatModel:
+def load_model(checkpoint_path: str, model_path: str, use_vllm_compat: bool = True):
     """
     Load TorchTitan model from checkpoint.
 
     Args:
         checkpoint_path: Path to TorchTitan checkpoint
         model_path: Path to HuggingFace model (for config)
+        use_vllm_compat: If True, use vLLM-compatible model, else use standard model
 
     Returns:
         model: Loaded TorchTitan model
@@ -291,12 +299,23 @@ def load_model(checkpoint_path: str, model_path: str) -> Qwen3VLLMCompatModel:
         eos_id=getattr(hf_config, "eos_token_id", 151645),
     )
 
-    # Create and load model (using vLLM-compat for bitwise determinism)
-    model = Qwen3VLLMCompatModel(model_args)
+    # state_dict is in standard TorchTitan format (w1, w2, w3)
     state_dict = load_file(checkpoint_path)
-    # Convert to vLLM-compat format (merged gate_up_proj)
-    vllm_compat_state = torchtitan_to_vllm_compat(state_dict)
-    model.load_state_dict(vllm_compat_state, strict=False)
+
+    if use_vllm_compat:
+        # Create and load model (using vLLM-compat for bitwise determinism)
+        from torchtitan.models.qwen3.model.model_vllm_compat import Qwen3VLLMCompatModel
+        model = Qwen3VLLMCompatModel(model_args)
+        # Convert to vLLM-compat format (merged gate_up_proj, down_proj)
+        vllm_compat_state = torchtitan_to_vllm_compat(state_dict)
+        model.load_state_dict(vllm_compat_state, strict=False)
+    else:
+        # Use standard TorchTitan model
+        from torchtitan.models.qwen3 import Qwen3Model
+        model = Qwen3Model(model_args)
+        # Load standard TorchTitan format directly
+        model.load_state_dict(state_dict, strict=False)
+
     model.to(torch.bfloat16)
 
     return model
@@ -429,7 +448,7 @@ def policy_gradient_loss(log_probs: torch.Tensor, advantages: torch.Tensor) -> t
 
 
 def compute_policy_gradient_loss_vllm(
-    model: Qwen3VLLMCompatModel,
+    model: torch.nn.Module,
     vllm_token_ids: list[list[int]],
     vllm_token_log_probs: list[list[float]],
     prompt_token_ids: list[list[int]],
@@ -510,7 +529,7 @@ def compute_policy_gradient_loss_vllm(
 
     total_log_probs = torch.stack(batch_total_log_probs)
 
-    # Verify bitwise determinism between generation and training
+    # Verify bitwise determinism between vLLM and TorchTitan
     if first_sample_deltas:
         vllm_lps_f32 = torch.tensor(
             [d['vllm_logprob'] for d in first_sample_deltas],
@@ -524,14 +543,16 @@ def compute_policy_gradient_loss_vllm(
         bitwise_identical = torch.equal(vllm_lps_f32, titan_lps_f32)
 
         if bitwise_identical:
-            print(f"  ✓ Bitwise determinism verified: {len(first_sample_deltas)} tokens match exactly")
+            print(f"  ✓ vLLM-TorchTitan bitwise determinism verified: {len(first_sample_deltas)} tokens match exactly")
         else:
             num_different = (vllm_lps_f32 != titan_lps_f32).sum().item()
             deltas = (vllm_lps_f32 - titan_lps_f32).abs()
             max_delta = deltas.max().item()
             avg_delta = deltas.mean().item()
-            print(f"  ⚠ Determinism check: {num_different}/{len(first_sample_deltas)} tokens differ")
+            print(f"  ⚠ vLLM-TorchTitan logprobs differ: {num_different}/{len(first_sample_deltas)} tokens")
             print(f"    Max delta: {max_delta:.6e}, Avg delta: {avg_delta:.6e}")
+            print(f"    vLLM logprobs:     {[f'{lp:.10f}' for lp in vllm_lps_f32[:5].tolist()]}")
+            print(f"    TorchTitan logprobs: {[f'{lp:.10f}' for lp in titan_lps_f32[:5].tolist()]}")
 
     # PPO clipped objective
     log_ratio = total_log_probs - ref_log_probs
@@ -565,7 +586,7 @@ def compute_policy_gradient_loss_vllm(
 
 
 def rl_update_step(
-    model: Qwen3VLLMCompatModel,
+    model,
     tokenizer,
     vllm_engine: VLLMRolloutEngine,
     prompt_texts: list[str],
@@ -574,6 +595,7 @@ def rl_update_step(
     group_size: int = 8,
     max_new_tokens: int = 20,
     temperature: float = 1.0,
+    use_vllm_compat: bool = True,
 ) -> dict:
     """
     Perform one RL update step using vLLM for rollouts.
@@ -592,10 +614,40 @@ def rl_update_step(
     Returns:
         metrics: Dict of training metrics
     """
-    # Update vLLM weights in-place
-    vllm_engine.update_weights(model.state_dict())
+    # Update vLLM weights from current policy
+    from weights_vllm_compat import torchtitan_to_vllm_compat
+    titan_state = model.state_dict()
+    vllm_compat_state = torchtitan_to_vllm_compat(titan_state)
+    vllm_engine.update_weights(vllm_compat_state)
 
-    # Generate samples using vLLM (fast!)
+    # Round-trip: load weights back from disk to maintain consistency with vLLM
+    import glob
+    from safetensors.torch import load_file as sf_load
+    from weights.converter import vllm_to_torchtitan
+    from weights_vllm_compat import torchtitan_to_vllm_compat as titan_to_vllm_compat
+
+    shard_files = sorted(glob.glob(os.path.join(vllm_engine.temp_model_dir, "model-*.safetensors")))
+    if shard_files:
+        # Load all shards
+        all_disk_state = {}
+        for shard_file in shard_files:
+            shard_state = sf_load(shard_file)
+            all_disk_state.update(shard_state)
+
+        # Convert back to TorchTitan format
+        titan_from_disk = vllm_to_torchtitan(all_disk_state)
+
+        if use_vllm_compat:
+            # Convert to vLLM-compat format for vLLM-compatible model
+            weights_for_model = titan_to_vllm_compat(titan_from_disk)
+        else:
+            # Use standard TorchTitan format for standard model
+            weights_for_model = titan_from_disk
+
+        # Load back into model
+        model.load_state_dict(weights_for_model, strict=False)
+
+    # Generate samples using vLLM
     completions, vllm_log_probs, vllm_token_ids, vllm_token_log_probs, prompt_token_ids = vllm_engine.generate(
         prompt_texts,
         max_new_tokens,
@@ -713,12 +765,18 @@ def main():
     num_steps = 2  # Quick test - change to 100 for full training
     learning_rate = 1e-5
 
-    # Add backward pass support to vLLM's batch_invariant mode
-    # vLLM's init_batch_invariance() already set up deterministic forward passes,
-    # now we patch in backward support without disabling anything
-    print("Adding gradient support to vLLM's batch_invariant mode...")
-    from batch_invariant_backward import patch_batch_invariant_with_gradients
-    patch_batch_invariant_with_gradients()
+    # Check if batch invariance is enabled
+    from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
+    use_vllm_compat = vllm_is_batch_invariant()
+
+    if use_vllm_compat:
+        print("Batch invariance detected - using vLLM-compatible model")
+        # Add backward pass support to vLLM's batch_invariant mode
+        print("Adding gradient support to vLLM's batch_invariant mode...")
+        from batch_invariant_backward import patch_batch_invariant_with_gradients
+        patch_batch_invariant_with_gradients()
+    else:
+        print("Batch invariance NOT detected - using standard model")
 
     # Download and convert model
     print("=" * 80)
@@ -731,7 +789,7 @@ def main():
     # Load TorchTitan model for training
     print("\nLoading TorchTitan model for training...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(titan_checkpoint_path, model_path)
+    model = load_model(titan_checkpoint_path, model_path, use_vllm_compat=use_vllm_compat)
     model = model.to(device)
     model.train()
 
@@ -782,6 +840,7 @@ def main():
             group_size=group_size,
             max_new_tokens=20,
             temperature=1.0,
+            use_vllm_compat=use_vllm_compat,
         )
 
         # Compute weight deltas from initial state

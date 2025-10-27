@@ -112,7 +112,7 @@ def torchtitan_to_vllm(titan_state: dict[str, torch.Tensor]) -> dict[str, torch.
     Convert weights from TorchTitan format to vLLM format (HuggingFace).
 
     Args:
-        titan_state: TorchTitan state dict
+        titan_state: TorchTitan state dict (can be in vLLM-compat format with gate_up_proj)
 
     Returns:
         Dictionary with vLLM/HuggingFace-formatted state dict
@@ -123,6 +123,35 @@ def torchtitan_to_vllm(titan_state: dict[str, torch.Tensor]) -> dict[str, torch.
     vllm_state = {}
 
     for titan_key, tensor in titan_state.items():
+        # Handle merged gate_up_proj (vLLM-compat format) -> split into gate_proj + up_proj
+        if ".feed_forward.gate_up_proj.weight" in titan_key:
+            # Split into gate_proj (first half) and up_proj (second half)
+            hidden_dim = tensor.shape[0] // 2
+            # CLONE to avoid aliasing - these are views into the original tensor
+            gate_weight = tensor[:hidden_dim].clone()
+            up_weight = tensor[hidden_dim:].clone()
+
+            # Extract layer number
+            parts = titan_key.split(".")
+            layer_idx = parts[1]
+
+            # Create vLLM keys
+            gate_key = f"model.layers.{layer_idx}.mlp.gate_proj.weight"
+            up_key = f"model.layers.{layer_idx}.mlp.up_proj.weight"
+
+            vllm_state[gate_key] = gate_weight
+            vllm_state[up_key] = up_weight
+            continue
+
+        # Handle down_proj (vLLM-compat format)
+        if ".feed_forward.down_proj.weight" in titan_key:
+            parts = titan_key.split(".")
+            layer_idx = parts[1]
+            vllm_key = f"model.layers.{layer_idx}.mlp.down_proj.weight"
+            # CLONE to avoid aliasing
+            vllm_state[vllm_key] = tensor.clone()
+            continue
+
         # Check if it's a layer-specific weight
         if "layers." in titan_key:
             # Extract layer number
@@ -136,14 +165,16 @@ def torchtitan_to_vllm(titan_state: dict[str, torch.Tensor]) -> dict[str, torch.
             if abstract_titan_key in titan_to_vllm_map:
                 abstract_vllm_key = titan_to_vllm_map[abstract_titan_key]
                 vllm_key = abstract_vllm_key.format(layer_idx)
-                vllm_state[vllm_key] = tensor
+                # CLONE to avoid aliasing
+                vllm_state[vllm_key] = tensor.clone()
             else:
                 print(f"Warning: No mapping found for {titan_key}")
         else:
             # Non-layer weight
             if titan_key in titan_to_vllm_map:
                 vllm_key = titan_to_vllm_map[titan_key]
-                vllm_state[vllm_key] = tensor
+                # CLONE to avoid aliasing
+                vllm_state[vllm_key] = tensor.clone()
             else:
                 print(f"Warning: No mapping found for {titan_key}")
 
