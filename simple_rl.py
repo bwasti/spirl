@@ -184,6 +184,7 @@ class VLLMRolloutEngine:
             temperature=temperature,
             max_tokens=max_new_tokens,
             n=n_samples_per_prompt,
+            seed=42,
             logprobs=1,
             prompt_logprobs=1,  # Also get prompt log probs to access prompt token IDs
         )
